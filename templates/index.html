@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Piper TTS Control Panel</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        h1 { color: #333; text-align: center; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .card h2 { margin-top: 0; color: #444; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        label { display: block; margin-bottom: 5px; font-weight: 600; color: #555; }
+        input, select, textarea { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        textarea { resize: vertical; min-height: 100px; }
+        button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; margin-right: 10px; }
+        button:hover { background: #45a049; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        button.secondary { background: #2196F3; }
+        button.secondary:hover { background: #1976D2; }
+        .row { display: flex; gap: 20px; flex-wrap: wrap; }
+        .col { flex: 1; min-width: 200px; }
+        #audioPlayer { width: 100%; margin-top: 15px; }
+        #status { padding: 10px; border-radius: 4px; margin-top: 10px; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        .loading { background: #fff3cd; color: #856404; }
+        .voices-list { max-height: 300px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 10px; }
+        .voice-item { padding: 8px; cursor: pointer; border-radius: 4px; }
+        .voice-item:hover { background: #f0f0f0; }
+        .voice-item.selected { background: #e3f2fd; }
+        .slider-container { display: flex; align-items: center; gap: 10px; }
+        .slider-container input { flex: 1; margin: 0; }
+        .slider-value { min-width: 50px; text-align: right; }
+    </style>
+</head>
+<body>
+    <h1>Piper TTS Control Panel</h1>
+    
+    <div class="card">
+        <h2>Download Voice Model</h2>
+        <div class="row">
+            <div class="col">
+                <label for="voiceSelect">Select Voice:</label>
+                <select id="voiceSelect">
+                    <option value="">Loading voices...</option>
+                </select>
+            </div>
+            <div class="col" style="display: flex; align-items: flex-end;">
+                <button onclick="downloadVoice()" id="downloadBtn">Download Voice</button>
+            </div>
+        </div>
+        <div id="downloadStatus"></div>
+    </div>
+
+    <div class="card">
+        <h2>Synthesize Speech</h2>
+        <div class="row">
+            <div class="col">
+                <label for="currentVoice">Current Voice:</label>
+                <select id="currentVoice">
+                    <option value="">Loading...</option>
+                </select>
+            </div>
+            <div class="col">
+                <label for="speakerId">Speaker ID:</label>
+                <input type="number" id="speakerId" placeholder="0" min="0">
+            </div>
+        </div>
+        
+        <div class="row">
+            <div class="col">
+                <div class="slider-container">
+                    <label>Length Scale:</label>
+                    <input type="range" id="lengthScale" min="0.1" max="2.0" step="0.1" value="1.0" oninput="document.getElementById('lengthScaleVal').textContent = this.value">
+                    <span class="slider-value" id="lengthScaleVal">1.0</span>
+                </div>
+            </div>
+            <div class="col">
+                <div class="slider-container">
+                    <label>Noise Scale:</label>
+                    <input type="range" id="noiseScale" min="0.1" max="2.0" step="0.1" value="0.667" oninput="document.getElementById('noiseScaleVal').textContent = this.value">
+                    <span class="slider-value" id="noiseScaleVal">0.667</span>
+                </div>
+            </div>
+            <div class="col">
+                <div class="slider-container">
+                    <label>Noise W:</label>
+                    <input type="range" id="noiseWScale" min="0.1" max="2.0" step="0.1" value="0.8" oninput="document.getElementById('noiseWScaleVal').textContent = this.value">
+                    <span class="slider-value" id="noiseWScaleVal">0.8</span>
+                </div>
+            </div>
+        </div>
+
+        <label for="textInput">Text to Synthesize:</label>
+        <textarea id="textInput" placeholder="Enter text to convert to speech..."></textarea>
+        
+        <button onclick="synthesize()" class="secondary" id="synthBtn">Generate Speech</button>
+        <button onclick="downloadAudio()" id="downloadAudioBtn" disabled>Download Audio</button>
+        
+        <div id="synthStatus"></div>
+        <audio id="audioPlayer" controls></audio>
+    </div>
+
+    <div class="card">
+        <h2>Server Status</h2>
+        <div id="serverStatus">Loading...</div>
+    </div>
+
+    <script>
+        let currentAudioBlob = null;
+        let activeServerModel = '';
+
+        async function fetchAllVoices() {
+            try {
+                const response = await fetch('/all-voices');
+                const voices = await response.json();
+                const select = document.getElementById('voiceSelect');
+                select.innerHTML = '';
+                
+                const voiceIds = Object.keys(voices).sort();
+                if (voiceIds.length === 0) {
+                    select.innerHTML = '<option value="">No voices available (check internet)</option>';
+                    return;
+                }
+                
+                voiceIds.forEach(id => {
+                    const option = document.createElement('option');
+                    option.value = id;
+                    option.textContent = id;
+                    select.appendChild(option);
+                });
+            } catch (e) {
+                document.getElementById('voiceSelect').innerHTML = '<option value="">Failed to load</option>';
+            }
+        }
+
+        async function loadCurrentVoices(preferredVoice = '') {
+            try {
+                const response = await fetch('/voices');
+                const voices = await response.json();
+                const select = document.getElementById('currentVoice');
+                const previousValue = preferredVoice || select.value || activeServerModel;
+                select.innerHTML = '';
+                
+                const keys = Object.keys(voices).sort();
+                if (keys.length === 0) {
+                    select.innerHTML = '<option value="">No downloaded voices</option>';
+                    return;
+                }
+                
+                keys.forEach(id => {
+                    const option = document.createElement('option');
+                    option.value = id;
+                    option.textContent = id;
+                    select.appendChild(option);
+                });
+
+                const nextValue = keys.includes(previousValue)
+                    ? previousValue
+                    : (keys.includes(activeServerModel) ? activeServerModel : keys[0]);
+                select.value = nextValue;
+            } catch (e) {
+                console.error('Failed to load current voices:', e);
+            }
+        }
+
+        async function checkHealth() {
+            try {
+                const response = await fetch('/health');
+                const data = await response.json();
+                
+                let statusClass = data.status === 'ok' ? 'success' : 'error';
+                let statusHtml = `
+                    <strong>Status:</strong> <span class="${statusClass}">${data.status.toUpperCase()}</span><br>
+                    <strong>Message:</strong> ${data.message || 'Ready'}<br>
+                    <strong>Default Model:</strong> ${data.model}<br>
+                    <strong>Voice Ready:</strong> ${data.default_voice_ready ? 'Yes' : '<span class="error">No - Download a voice model first</span>'}<br>
+                    <strong>Loaded Voices:</strong> ${data.loaded_voices.length > 0 ? data.loaded_voices.join(', ') : 'None'}
+                `;
+                document.getElementById('serverStatus').innerHTML = statusHtml;
+                activeServerModel = data.model || '';
+                
+                if (!data.default_voice_ready) {
+                    document.getElementById('synthStatus').innerHTML = '<div class="error">No voice model loaded. Please download a voice model first.</div>';
+                    document.getElementById('synthBtn').disabled = true;
+                } else {
+                    document.getElementById('synthBtn').disabled = false;
+                }
+                
+                await loadCurrentVoices(activeServerModel);
+            } catch (e) {
+                document.getElementById('serverStatus').innerHTML = '<span class="error">Server unavailable - is the server running?</span>';
+            }
+        }
+
+        async function downloadVoice() {
+            const voice = document.getElementById('voiceSelect').value;
+            if (!voice) return;
+
+            const status = document.getElementById('downloadStatus');
+            const btn = document.getElementById('downloadBtn');
+            btn.disabled = true;
+            status.innerHTML = '<div class="loading">Downloading voice model... (this may take a few minutes)</div>';
+
+            try {
+                const response = await fetch('/download', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({voice: voice, force_redownload: false})
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    status.innerHTML = '<div class="success">' + result.message + '</div>';
+                    activeServerModel = result.voice || activeServerModel;
+                    await loadCurrentVoices(result.voice || activeServerModel);
+                } else {
+                    status.innerHTML = '<div class="error">Download failed: ' + (result.detail || 'Unknown error') + '</div>';
+                }
+                await checkHealth();
+            } catch (e) {
+                status.innerHTML = '<div class="error">Download failed: ' + e.message + '</div>';
+            }
+            btn.disabled = false;
+        }
+
+        async function synthesize() {
+            const text = document.getElementById('textInput').value.trim();
+            if (!text) {
+                document.getElementById('synthStatus').innerHTML = '<div class="error">Please enter text</div>';
+                return;
+            }
+
+            const voice = document.getElementById('currentVoice').value;
+            const speakerId = document.getElementById('speakerId').value;
+            const lengthScale = document.getElementById('lengthScale').value;
+            const noiseScale = document.getElementById('noiseScale').value;
+            const noiseWScale = document.getElementById('noiseWScale').value;
+
+            const status = document.getElementById('synthStatus');
+            const btn = document.getElementById('synthBtn');
+            btn.disabled = true;
+            status.innerHTML = '<div class="loading">Generating speech...</div>';
+
+            const params = new URLSearchParams({text});
+            if (voice) params.append('voice', voice);
+            if (speakerId) params.append('speaker_id', speakerId);
+            params.append('length_scale', lengthScale);
+            params.append('noise_scale', noiseScale);
+            params.append('noise_w_scale', noiseWScale);
+
+            try {
+                const response = await fetch('/synthesize?' + params.toString());
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Synthesis failed');
+                }
+                
+                const blob = await response.blob();
+                currentAudioBlob = blob;
+                
+                const url = URL.createObjectURL(blob);
+                const audio = document.getElementById('audioPlayer');
+                audio.src = url;
+                
+                document.getElementById('downloadAudioBtn').disabled = false;
+                status.innerHTML = '<div class="success">Speech generated!</div>';
+            } catch (e) {
+                status.innerHTML = '<div class="error">Error: ' + e.message + '</div>';
+            }
+            btn.disabled = false;
+        }
+
+        function downloadAudio() {
+            if (!currentAudioBlob) return;
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(currentAudioBlob);
+            a.download = 'piper_output.wav';
+            a.click();
+        }
+
+        fetchAllVoices();
+        checkHealth();
+        setInterval(checkHealth, 30000);
+    </script>
+</body>
+</html>

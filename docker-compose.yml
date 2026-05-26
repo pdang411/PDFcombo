@@ -1,0 +1,84 @@
+name: pdf-reader
+
+networks:
+  piper-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.22.0.0/16
+
+services:
+  piper-tts:
+    build:
+      context: .
+      dockerfile: Dockerfile.tts
+    container_name: piper_tts_server
+    ports:
+      - "5000:5000"
+    environment:
+      - MODEL=en_GB-cori-medium
+      - DATA_DIR=/app/data
+      - HOST=0.0.0.0
+      - PORT=5000
+      - USE_CUDA=false
+      - ESPEAK_DATA_PATH=/usr/share/espeak-ng-data
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    networks:
+      piper-net:
+        ipv4_address: 172.22.0.10
+
+  pdf-reader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdf_audiobook_reader
+    ports:
+      - "8501:8501"
+    environment:
+      - TTS_BASE_URL=http://piper-tts:5000
+      - LLM_URL=http://host.docker.internal:11434
+      - LLM_MODEL=
+      - LLM_ENABLED=false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    restart: unless-stopped
+    networks:
+      piper-net:
+        ipv4_address: 172.22.0.11
+    depends_on:
+      piper-tts:
+        condition: service_healthy
+    command: >
+      sh -c "streamlit run app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true --server.fileWatcherType=none --browser.gatherUsageStats=false"
+
+  pdf-teacher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdf_tutor
+    ports:
+      - "8502:8502"
+    environment:
+      - TTS_BASE_URL=http://piper-tts:5000
+      - LLM_URL=http://host.docker.internal:11434
+      - LLM_MODEL=
+      - LLM_ENABLED=false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    restart: unless-stopped
+    networks:
+      piper-net:
+        ipv4_address: 172.22.0.12
+    depends_on:
+      piper-tts:
+        condition: service_healthy
+    command: >
+      sh -c "streamlit run pdf_tutor.py --server.address=0.0.0.0 --server.port=8502 --server.headless=true --server.fileWatcherType=none --browser.gatherUsageStats=false"
