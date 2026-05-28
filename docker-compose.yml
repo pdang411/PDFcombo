@@ -38,11 +38,6 @@ services:
       - "8501:8501"
     environment:
       - TTS_BASE_URL=http://piper-tts:5000
-      - LLM_URL=http://host.docker.internal:11434
-      - LLM_MODEL=
-      - LLM_ENABLED=false
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - .:/app
       - ./data:/app/data
@@ -65,11 +60,6 @@ services:
       - "8502:8502"
     environment:
       - TTS_BASE_URL=http://piper-tts:5000
-      - LLM_URL=http://host.docker.internal:11434
-      - LLM_MODEL=
-      - LLM_ENABLED=false
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - .:/app
       - ./data:/app/data

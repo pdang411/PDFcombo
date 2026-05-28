@@ -7,6 +7,7 @@ import os
 import re
 import struct
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import requests
 import streamlit as st
@@ -14,14 +15,6 @@ import streamlit.components.v1 as components
 from pydub import AudioSegment
 from pydub.utils import which
 from pipertalk.tts_utils import clean_text_for_tts, pcm_to_wav
-
-try:
-    from pipertalk.agent.executor import AgentExecutor as _AgentExecutor
-    def run_piper_agent(goal: str) -> str:
-        return _AgentExecutor().execute(goal)
-except ImportError:
-    def run_piper_agent(goal: str) -> str:
-        return f"Agent not available. Goal was: {goal}"
 
 import PyPDF2
 import fitz  # PyMuPDF
@@ -41,8 +34,6 @@ except Exception:
 TESSERACT_PATH = os.getenv("TESSERACT_PATH", "")
 
 TTS_BASE_URL = os.getenv("TTS_BASE_URL", "http://localhost:5000")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://192.168.1.16:11434")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:e4b")
 
 TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "10000"))
 PDF_RENDER_ZOOM = float(os.getenv("PDF_RENDER_ZOOM", "1.6"))
@@ -118,27 +109,6 @@ def _fetch_voices() -> dict:
     return {}
 
 
-@st.cache_data(ttl=5, show_spinner=False)
-def _fetch_tts_health() -> dict:
-    """Fetches current TTS server health and active model."""
-    try:
-        r = requests.get(f"{TTS_BASE_URL}/health", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
-
-
-# --- Legacy / Stub Helpers ---
-def chat_lm(prompt: str):
-    """Stub: LLM chat is handled by chat_assistant service.
-    Returns placeholder string."""
-    return "(LLM disabled in this application)"
-
-
 @st.cache_data(max_entries=32, show_spinner=False)
 def speak(text: str):
     """Cached wrapper: synthesizes text via PiperHTTPClient.
@@ -166,39 +136,6 @@ def listen(timeout: float = 5.0) -> str:
     raise RuntimeError(
         "Audio recording requires browser microphone access. Use the record button in the UI."
     )
-
-
-# --- LLM HTTP Client ---
-class LLMHTTPClient:
-    """HTTP client for Ollama LLM API. Sends prompts to /api/generate
-    and returns the response text. Supports streaming flag."""
-    def __init__(
-        self, base_url: str = LLM_BASE_URL, model: str = LLM_MODEL, timeout: int = 60
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = timeout
-
-    def generate(self, prompt: str, stream: bool = False) -> str:
-        url = f"{self.base_url}/api/generate"
-        payload = {"model": self.model, "prompt": prompt, "stream": stream}
-        try:
-            resp = requests.post(url, json=payload, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("response", "")
-        except Exception as e:
-            raise RuntimeError(f"LLM request failed: {e}")
-
-
-@st.cache_resource
-def get_llm_client():
-    """Returns cached LLMHTTPClient singleton for the session."""
-    try:
-        return LLMHTTPClient()
-    except Exception as e:
-        print(f"Failed to initialize LLM client: {e}")
-        return None
 
 
 # --- PDF File Reading ---
@@ -284,6 +221,13 @@ except Exception:
     pass
 
 st.title("PDF Page-by-Page Audiobook Reader")
+
+st.markdown(
+    """<style>
+    img { max-width: 100% !important; height: auto !important; }
+    </style>""",
+    unsafe_allow_html=True,
+)
 
 
 # --- FFmpeg Setup ---
@@ -453,19 +397,6 @@ def get_current_page_text(pdf_bytes: bytes, use_ocr: bool = False) -> str:
     return get_pdf_page_text(pdf_bytes, page_index, use_ocr=use_ocr) or ""
 
 
-def generate_current_page_audio(pdf_bytes: bytes, use_ocr: bool = False, rate: float = 1.0):
-    """Builds audio for the current page only and returns page text with audio."""
-    page_text = get_current_page_text(pdf_bytes, use_ocr=use_ocr)
-    if not page_text.strip():
-        return page_text, None
-    audio_buffer = convert_text_to_audio(
-        page_text,
-        rate,
-        **_voice_kwargs(),
-    )
-    return page_text, audio_buffer
-
-
 @st.cache_data(show_spinner=False)
 def cached_page_image(pdf_bytes: bytes, page_index: int, zoom: float = 1.6):
     """Renders a single PDF page as PNG image via PyMuPDF.
@@ -540,22 +471,20 @@ def _synthesize_cached(
     if len(clean_text) <= TTS_MAX_CHARS:
         return _synth(clean_text)
 
-    chunks = _split_text(clean_text, TTS_MAX_CHARS)
+    chunks = [c for c in _split_text(clean_text, TTS_MAX_CHARS) if c.strip()]
     if not chunks:
         return b""
 
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(_synth, chunks))
+
     pcm_parts = []
     sample_rate = 22050
-    first = True
-    for chunk in chunks:
-        if not chunk.strip():
-            continue
-        wav_bytes = _synth(chunk)
+    for wav_bytes in results:
         if not wav_bytes or len(wav_bytes) <= 44:
             continue
-        if first:
+        if sample_rate == 22050:
             sample_rate = struct.unpack_from("<I", wav_bytes, 24)[0]
-            first = False
         pcm_parts.append(wav_bytes[44:])
 
     if not pcm_parts:
@@ -759,13 +688,6 @@ def parse_voice_command(cmd: str) -> dict:
     for word, digit in _nums.items():
         cmd = re.sub(r"\b" + word + r"\b", digit, cmd)
 
-    if cmd.startswith(("agent ", "agent:", "do ")):
-        goal = re.sub(r"^(agent\s*:?\s*|do\s+)", "", cmd, flags=re.I).strip()
-        return {"type": "agent", "text": goal}
-
-    if re.search(r"\b(summarize|explain|key points|main points|study notes)\b", cmd):
-        return {"type": "agent", "text": cmd}
-
     has_read = bool(re.search(r"read|play|speak|repeat|reread|start|narrate|listen", cmd))
 
     if (m := re.search(r"(?:go\s+)?chapter\s*(\d+)", cmd)):
@@ -820,16 +742,13 @@ def _read_current_page(pdf_bytes=None, total_pages=None, enable_ocr=False, rate=
     if st.session_state.get("page_index", -1) < 0:
         st.sidebar.warning("No page selected.")
         return
+    page_text = (get_pdf_page_text(pdf_bytes, st.session_state["page_index"], use_ocr=enable_ocr) or "")
+    if not page_text.strip():
+        st.sidebar.info("No extractable text on this page (try enabling OCR).")
+        return
     with st.spinner("Generating audio for current page..."):
         try:
-            page_text, buf = generate_current_page_audio(
-                pdf_bytes,
-                use_ocr=enable_ocr,
-                rate=st.session_state.get("reading_rate", rate),
-            )
-            if not page_text.strip():
-                st.sidebar.info("No extractable text on this page (try enabling OCR).")
-                return
+            buf = convert_text_to_audio(page_text, st.session_state.get("reading_rate", rate), **_voice_kwargs())
             if not buf:
                 st.sidebar.warning("No text found on this page to generate audio.")
                 return
@@ -916,47 +835,8 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
     elif t == "read":
         _read_current_page(pdf_bytes, total_pages, enable_ocr, rate, sync_highlight)
 
-    elif t == "agent":
-        page_text = get_current_page_text(pdf_bytes, use_ocr=enable_ocr)
-        goal = parsed.get("text", "").strip() or "summarize this PDF page"
-        if page_text.strip():
-            goal = f"{goal}\n\nCurrent PDF page {st.session_state['page_index'] + 1} of {total_pages}:\n{page_text[:6000]}"
-        st.sidebar.info(f"Piper agent: {parsed.get('text', goal)[:80]}")
-        with st.spinner("Piper agent working..."):
-            reply = run_piper_agent(goal)
-        st.sidebar.success(reply[:1000])
-        with st.spinner("Generating agent audio..."):
-            wav = convert_text_to_audio(reply, rate=rate, **_voice_kwargs())
-            if wav:
-                st.sidebar.audio(wav, format="audio/wav", autoplay=True)
-                if sync_highlight:
-                    try:
-                        components.html(build_sync_player_html(wav.getvalue(), reply), height=260)
-                    except Exception:
-                        pass
-
     elif t == "unknown":
-        st.sidebar.info(f"Sending to LLM: '{cmd}'")
-        with st.spinner("LLM processing..."):
-            try:
-                llm = get_llm_client()
-                if llm:
-                    reply = llm.generate(cmd)
-                    st.sidebar.success(f"LLM: {reply}")
-                    with st.spinner("Generating audio..."):
-                        wav = convert_text_to_audio(reply, rate=rate, **_voice_kwargs())
-                        if wav:
-                            st.sidebar.audio(wav, format="audio/wav", autoplay=True)
-                            if sync_highlight:
-                                try:
-                                    components.html(build_sync_player_html(wav.getvalue(), reply), height=260)
-                                except Exception:
-                                    pass
-
-                else:
-                    st.sidebar.error("LLM not available")
-            except Exception as e:
-                st.sidebar.error(f"LLM error: {e}")
+        st.sidebar.info(f"Unrecognised command: '{cmd}'")
 
 
 # --- UI: Sidebar uploader / speed controls ---
@@ -997,62 +877,32 @@ st.sidebar.write(f"Current speed: {rate}")
 st.sidebar.divider()
 st.sidebar.subheader("Voice Settings")
 _voices_data = _fetch_voices()
-_tts_health = _fetch_tts_health()
-
-# --- Backend-centric voice selection logic ---
-
-# --- Voice Defaulting: Set default to backend model when new voice is detected ---
-_server_model = _tts_health.get("model")
-_voice_options = ["Server default", *_voices_data.keys()]
-
-# Track previous voices to detect new downloads
-prev_voices = st.session_state.get("_prev_voice_list", [])
-curr_voices = list(_voices_data.keys())
-new_voice_downloaded = False
-if set(curr_voices) != set(prev_voices):
-    st.session_state["_prev_voice_list"] = curr_voices
-    new_voice_downloaded = True
-
-# Always reflect backend MODEL after a new voice is downloaded
-if (
-    _server_model
-    and _server_model in _voices_data
-    and (st.session_state.get("tts_voice_name") != _server_model or new_voice_downloaded)
-):
-    st.session_state["tts_voice_name"] = _server_model
-    st.session_state.pop("tts_spk_name", None)
-    st.session_state.pop("tts_spk_num", None)
-
-# If no voice is selected, default to backend MODEL
-if st.session_state.get("tts_voice_name") not in _voice_options:
-    if "en_GB-alba-medium" in _voice_options:
-        st.session_state["tts_voice_name"] = "en_GB-alba-medium"
-    else:
-        st.session_state["tts_voice_name"] = (
-            _server_model if _server_model in _voices_data else "Server default"
-        )
-
-_sel_voice = st.sidebar.selectbox("Voice model", _voice_options, key="tts_voice_name")
-_spk_id = None
-if _sel_voice != "Server default":
+_vnames = list(_voices_data.keys())
+if _vnames:
+    _sel_voice = st.sidebar.selectbox("Voice model", _vnames, key="tts_voice_name")
     _vcfg = _voices_data.get(_sel_voice, {})
-    _num_spk = int(_vcfg.get("num_speakers", 1) or 1)
-    if _num_spk > 1:
+    _num_spk = _vcfg.get("num_speakers", 1)
+    if _num_spk and int(_num_spk) > 1:
         _spk_map = _vcfg.get("speaker_id_map", {})
         if _spk_map:
-            _speaker_names = list(_spk_map.keys())
-            if st.session_state.get("tts_spk_name") not in _speaker_names:
-                st.session_state["tts_spk_name"] = _speaker_names[0]
-            _spk_name = st.sidebar.selectbox("Speaker", _speaker_names, key="tts_spk_name")
+            _spk_name = st.sidebar.selectbox(
+                "Speaker", list(_spk_map.keys()), key="tts_spk_name"
+            )
             _spk_id = int(_spk_map[_spk_name])
         else:
             _spk_id = int(
                 st.sidebar.number_input(
-                    "Speaker ID", 0, max(0, _num_spk - 1), 0, key="tts_spk_num"
+                    "Speaker ID", 0, max(0, int(_num_spk) - 1), 0, key="tts_spk_num"
                 )
             )
-st.session_state["tts_voice"] = None if _sel_voice == "Server default" else _sel_voice
-st.session_state["tts_speaker_id"] = _spk_id
+    else:
+        _spk_id = None
+    st.session_state["tts_voice"] = _sel_voice
+    st.session_state["tts_speaker_id"] = _spk_id
+else:
+    st.sidebar.caption("No voices found on TTS server - using server default.")
+    st.session_state["tts_voice"] = None
+    st.session_state["tts_speaker_id"] = None
 
 st.sidebar.slider(
     "Length scale (pace)", 0.5, 2.0, 1.0, 0.05,
@@ -1122,6 +972,8 @@ if uploaded_pdf or local_pdf_choice:
     audio_container = st.empty()
 
     st.sidebar.subheader("Navigation")
+
+    st.sidebar.metric("Current Page", f"{st.session_state['page_index'] + 1} / {total_pages}")
 
     page_input = st.sidebar.number_input(
         "Page number",
@@ -1363,13 +1215,13 @@ if uploaded_pdf or local_pdf_choice:
     page_text = get_current_page_text(pdf_bytes, use_ocr=enable_ocr)
     escaped = html.escape(page_text)
     html_content = f"""
-    <div style='width:1200px; height:1200px; overflow:auto; border:1px solid #ddd; padding:12px; background:#fff;'>
-      <pre style='white-space:pre-wrap; font-family:inherit; font-size:16px; line-height:1.5; margin:0;'>
+    <div style='width:100%; max-width:100%; height:600px; overflow-y:auto; border:1px solid #ddd; padding:12px; background:#fff; box-sizing:border-box;'>
+      <pre style='white-space:pre-wrap; font-family:inherit; font-size:16px; line-height:1.6; margin:0; word-wrap:break-word;'>
 {escaped}
       </pre>
     </div>
     """
-    components.html(html_content, height=1200)
+    components.html(html_content, height=600)
 
     if "last_audio_bytes" in st.session_state and st.session_state["last_audio_bytes"]:
         try:
@@ -1378,41 +1230,45 @@ if uploaded_pdf or local_pdf_choice:
             pass
 
     audio_buffer = None
-    start_reading = st.sidebar.button("Start Reading", key="start_reading")
-    generate_no_play = st.sidebar.button("Generate (no play)", key="gen_no_play")
-    if start_reading or generate_no_play:
-        spinner_text = "Generating audio for this page..."
-        if generate_no_play:
-            spinner_text = "Generating audio for this entire page (no play)..."
-        with st.spinner(spinner_text):
+    if st.sidebar.button("Start Reading", key="start_reading"):
+        with st.spinner("Generating audio for this page..."):
             try:
-                page_text, audio_buffer = generate_current_page_audio(
-                    pdf_bytes,
-                    use_ocr=enable_ocr,
-                    rate=rate,
-                )
-                if not page_text.strip():
-                    st.sidebar.info("No extractable text on this page (try enabling OCR).")
-                    audio_buffer = None
+                audio_buffer = convert_text_to_audio(page_text, rate, **_voice_kwargs())
             except Exception as e:
                 st.sidebar.error(f"Audio generation failed: {e}")
                 audio_buffer = None
 
     if audio_buffer is not None:
-        if start_reading:
-            audio_container.audio(audio_buffer, format="audio/wav", autoplay=True)
-            try:
-                if sync_highlight:
-                    html_player = build_sync_player_html(audio_buffer.getvalue(), page_text)
-                    components.html(html_player, height=260)
-            except Exception:
-                pass
+        audio_container.audio(audio_buffer, format="audio/wav", autoplay=True)
+        try:
+            if sync_highlight:
+                html_player = build_sync_player_html(audio_buffer.getvalue(), page_text)
+                components.html(html_player, height=260)
+        except Exception:
+            pass
         st.sidebar.download_button(
             "Download This Page as WAV",
             data=audio_buffer,
             file_name=f"page_{page_index + 1}.wav",
             mime="audio/wav",
-            key=f"download_page_{page_index}_{uuid.uuid4().hex}",
+            key=f"download_play_{page_index}_{uuid.uuid4().hex}",
+        )
+
+    if st.sidebar.button("Generate (no play)", key="gen_no_play"):
+        with st.spinner("Generating audio for this page (no play)..."):
+            try:
+                audio_buffer = convert_text_to_audio(page_text, rate, **_voice_kwargs())
+            except Exception as e:
+                st.sidebar.error(f"Audio generation failed: {e}")
+                audio_buffer = None
+
+    if audio_buffer is not None:
+        st.sidebar.download_button(
+            "Download This Page as WAV",
+            data=audio_buffer,
+            file_name=f"page_{page_index + 1}.wav",
+            mime="audio/wav",
+            key=f"download_noplay_{page_index}_{uuid.uuid4().hex}",
         )
 else:
     st.info("Upload a PDF in the sidebar to begin.")
