@@ -34,39 +34,14 @@ from pipertalk.tts_utils import pcm_to_wav
 
 
 def _voice_kwargs() -> dict:
+    voice = st.session_state.get("tts_voice")
     return dict(
-        voice=st.session_state.get("tts_voice"),
+        voice=None if voice == "default" else voice,
         speaker_id=st.session_state.get("tts_speaker_id"),
         length_scale=st.session_state.get("tts_length_scale"),
         noise_scale=st.session_state.get("tts_noise_scale"),
         noise_w_scale=st.session_state.get("tts_noise_w"),
     )
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def _fetch_voices() -> dict:
-    try:
-        r = requests.get(f"{TTS_BASE_URL}/voices", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
-
-
-@st.cache_data(ttl=5, show_spinner=False)
-def _fetch_tts_health() -> dict:
-    try:
-        r = requests.get(f"{TTS_BASE_URL}/health", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
 
 
 # --- Page configuration ---
@@ -504,53 +479,13 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Voice Settings")
-    voices_data = _fetch_voices()
-    tts_health = _fetch_tts_health()
-    server_model = tts_health.get("model")
-    voice_options = ["Server default", *voices_data.keys()]
-
-    # Always reflect backend MODEL after a new voice is downloaded
-    if (
-        server_model
-        and server_model in voices_data
-        and st.session_state.get("tts_voice_name") != server_model
-    ):
-        st.session_state["tts_voice_name"] = server_model
-        st.session_state.pop("tts_spk_name", None)
-        st.session_state.pop("tts_spk_num", None)
-
-    # If no voice is selected, default to backend MODEL
-    if st.session_state.get("tts_voice_name") not in voice_options:
-        st.session_state["tts_voice_name"] = (
-            server_model if server_model in voices_data else "Server default"
-        )
-
-    selected_voice = st.selectbox("TTS voice model", voice_options, key="tts_voice_name")
-    speaker_id = None
-    if selected_voice != "Server default":
-        voice_config = voices_data.get(selected_voice, {})
-        num_speakers = int(voice_config.get("num_speakers", 1) or 1)
-        if num_speakers > 1:
-            speaker_map = voice_config.get("speaker_id_map", {})
-            if speaker_map:
-                speaker_names = list(speaker_map.keys())
-                if st.session_state.get("tts_spk_name") not in speaker_names:
-                    st.session_state["tts_spk_name"] = speaker_names[0]
-                speaker_name = st.selectbox("Speaker", speaker_names, key="tts_spk_name")
-                speaker_id = int(speaker_map[speaker_name])
-            else:
-                speaker_id = int(
-                    st.number_input(
-                        "Speaker ID",
-                        min_value=0,
-                        max_value=max(0, num_speakers - 1),
-                        value=0,
-                        step=1,
-                        key="tts_spk_num",
-                    )
-                )
-    st.session_state["tts_voice"] = None if selected_voice == "Server default" else selected_voice
-    st.session_state["tts_speaker_id"] = speaker_id
+    voice_models = ["default", "en_US-lessac-medium", "en_US-amy-medium", "en_US-danny-low", "en_GB-alan-medium"]
+    v_idx = 0
+    saved_voice = st.session_state.get("tts_voice", "default")
+    if saved_voice in voice_models:
+        v_idx = voice_models.index(saved_voice)
+    st.selectbox("TTS voice model", voice_models, index=v_idx, key="tts_voice")
+    st.number_input("Speaker ID", min_value=0, max_value=10, value=st.session_state.get("tts_speaker_id", 0), step=1, key="tts_speaker_id")
     st.slider("Length scale", 0.5, 2.0, st.session_state.get("tts_length_scale", 1.0), 0.1, key="tts_length_scale")
     st.slider("Noise scale", 0.0, 1.5, st.session_state.get("tts_noise_scale", 0.667), 0.01, key="tts_noise_scale")
     st.slider("Noise W", 0.0, 1.0, st.session_state.get("tts_noise_w", 0.8), 0.01, key="tts_noise_w")

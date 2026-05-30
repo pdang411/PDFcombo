@@ -3,9 +3,6 @@ name: pdf-reader
 networks:
   piper-net:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.22.0.0/16
 
 services:
   piper-tts:
@@ -26,8 +23,7 @@ services:
       - ./data:/app/data
     restart: unless-stopped
     networks:
-      piper-net:
-        ipv4_address: 172.22.0.10
+      - piper-net
 
   pdf-reader:
     build:
@@ -38,18 +34,12 @@ services:
       - "8501:8501"
     environment:
       - TTS_BASE_URL=http://piper-tts:5000
-      - LLM_URL=http://host.docker.internal:11434
-      - LLM_MODEL=
-      - LLM_ENABLED=false
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - .:/app
       - ./data:/app/data
     restart: unless-stopped
     networks:
-      piper-net:
-        ipv4_address: 172.22.0.11
+      - piper-net
     depends_on:
       piper-tts:
         condition: service_healthy
@@ -65,18 +55,12 @@ services:
       - "8502:8502"
     environment:
       - TTS_BASE_URL=http://piper-tts:5000
-      - LLM_URL=http://host.docker.internal:11434
-      - LLM_MODEL=
-      - LLM_ENABLED=false
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - .:/app
       - ./data:/app/data
     restart: unless-stopped
     networks:
-      piper-net:
-        ipv4_address: 172.22.0.12
+      - piper-net
     depends_on:
       piper-tts:
         condition: service_healthy

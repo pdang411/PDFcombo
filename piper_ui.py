@@ -425,75 +425,7 @@ async def audio_speech(req: SynthesizeRequest) -> Response:
     return await synthesize(req)
 
 
-LLM_URL = os.getenv("LLM_URL", "http://localhost:11434")
-_llm_session = requests.Session()
 
-
-def _clean_env_value(value: str, default: str) -> str:
-    cleaned = (value or default).strip().strip('"').strip("'")
-    return cleaned or default
-
-
-def _extract_ollama_error(resp: requests.Response) -> str:
-    try:
-        data = resp.json()
-    except ValueError:
-        data = None
-
-    if isinstance(data, dict) and data.get("error"):
-        return str(data["error"])
-
-    body = resp.text.strip()
-    return body or f"HTTP {resp.status_code}"
-
-
-def _format_llm_error(model: str, message: str) -> str:
-    lower_message = message.lower()
-    if "model not found" in lower_message or "not found" in lower_message:
-        return (
-            f"Configured LLM model '{model}' was not found. "
-            "Set LLM_MODEL to a model name supported by your configured LLM backend."
-        )
-    return message
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-LLM_MODEL = _clean_env_value(os.getenv("LLM_MODEL", ""), "")
-LLM_ENABLED = _env_flag("LLM_ENABLED", False)
-
-
-def _llm_stream(prompt: str):
-    if not LLM_ENABLED:
-        yield "LLM is disabled. Set LLM_ENABLED=true to enable conversational replies."
-        return
-    try:
-        model = _clean_env_value(LLM_MODEL, "")
-        if not model:
-            raise RuntimeError("LLM_MODEL is required when LLM_ENABLED is true.")
-        resp = _llm_session.post(
-            f"{LLM_URL}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": True},
-            stream=True,
-            timeout=120,
-        )
-        if not resp.ok:
-            raise RuntimeError(_format_llm_error(model, _extract_ollama_error(resp)))
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            data = json.loads(line)
-            chunk = data.get("response", "")
-            if chunk:
-                yield chunk
-    except Exception as e:
-        _LOGGER.error(f"LLM stream error: {e}")
-        yield f"[LLM error: {e}]"
 
 
 def _pipeline_synthesize(text: str):
@@ -511,30 +443,6 @@ def _pipeline_synthesize(text: str):
     except Exception as e:
         _LOGGER.error(f"Pipeline TTS error: {e}")
 
-
-AGENT_TRIGGERS = ["do ", "agent:", "agent "]
-
-
-def _run_agent(goal: str) -> str:
-    try:
-        from pipertalk.agent.executor import AgentExecutor
-        executor = AgentExecutor()
-        return executor.execute(goal)
-    except ImportError:
-        _LOGGER.warning("Agent module not available. Install pipertalk package.")
-        return f"Agent not available. Goal was: {goal}"
-    except Exception as e:
-        _LOGGER.error(f"Agent error: {e}")
-        return f"Agent failed: {e}"
-
-
-@app.post("/agent")
-async def agent_endpoint(req: SynthesizeRequest) -> dict:
-    goal = req.text.strip()
-    if not goal:
-        raise HTTPException(status_code=400, detail="No goal provided")
-    result = _run_agent(goal)
-    return {"goal": goal, "result": result}
 
 
 @app.websocket("/ws/voice")
@@ -554,27 +462,6 @@ async def voice_pipeline(websocket: WebSocket):
 
             if msg_type != "text" or not data:
                 await websocket.send_json({"type": "error", "data": "Expected text message"})
-                continue
-
-            is_agent = any(data.lower().startswith(t) for t in AGENT_TRIGGERS)
-            if is_agent:
-                goal = data
-                for t in AGENT_TRIGGERS:
-                    if goal.lower().startswith(t):
-                        goal = goal[len(t):].strip()
-                        break
-                await websocket.send_json({"type": "status", "state": "thinking"})
-                await websocket.send_json({"type": "status", "state": "speaking"})
-                for chunk in _pipeline_synthesize(f"Working on: {goal[:60]}"):
-                    pcm_b64 = base64.b64encode(chunk["data"]).decode("ascii")
-                    await websocket.send_json({"type": "audio", "pcm": pcm_b64, "sr": chunk["sr"]})
-                result = _run_agent(goal)
-                await websocket.send_json({"type": "text", "data": result})
-                await websocket.send_json({"type": "status", "state": "speaking"})
-                for chunk in _pipeline_synthesize(result):
-                    pcm_b64 = base64.b64encode(chunk["data"]).decode("ascii")
-                    await websocket.send_json({"type": "audio", "pcm": pcm_b64, "sr": chunk["sr"]})
-                await websocket.send_json({"type": "status", "state": "done"})
                 continue
 
             await websocket.send_json({"type": "status", "state": "thinking"})
