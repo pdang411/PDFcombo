@@ -865,11 +865,10 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
 # --- UI: Sidebar uploader / speed controls ---
 use_local_file = st.sidebar.checkbox(
     "Load PDF from server",
-    value=bool(PDF_DIR),
     help="Use a PDF already present on the server instead of uploading via browser.",
 )
 if PDF_DIR:
-    st.sidebar.caption(f"PDF directory: {PDF_DIR}")
+    st.sidebar.caption(f"📁 Server PDFs: {PDF_DIR}")
 else:
     st.sidebar.caption("Server PDFs are faster than browser uploads.")
 local_pdf_choice = None
