@@ -36,8 +36,9 @@ TESSERACT_PATH = os.getenv("TESSERACT_PATH", "")
 TTS_BASE_URL = os.getenv("TTS_BASE_URL", "http://localhost:5000")
 
 TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "10000"))
-PDF_RENDER_ZOOM = float(os.getenv("PDF_RENDER_ZOOM", "1.6"))
+PDF_RENDER_ZOOM = float(os.getenv("PDF_RENDER_ZOOM", "1.5"))
 PDF_READ_CHUNK_SIZE = int(os.getenv("PDF_READ_CHUNK_SIZE", str(1024 * 1024)))
+PDF_DIR = os.getenv("PDF_DIR", "")
 
 
 # --- Piper TTS HTTP Client ---
@@ -150,6 +151,38 @@ def _read_pdf_bytes(path_or_file):
         with open(path_or_file, "rb") as fh:
             return fh.read()
     return path_or_file.read()
+
+
+def _get_or_open_doc(pdf_bytes: bytes):
+    """Returns a cached fitz.Document from session_state, or opens one.
+    Avoids re-parsing the full PDF binary on every page operation."""
+    doc = st.session_state.get("_pdf_doc")
+    if doc is None:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        st.session_state["_pdf_doc"] = doc
+    return doc
+
+
+def _close_pdf_doc():
+    """Closes and removes the cached fitz.Document from session state."""
+    doc = st.session_state.pop("_pdf_doc", None)
+    if doc is not None:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+def _get_page_count(pdf_bytes: bytes) -> int:
+    """Returns page count from cached fitz document."""
+    try:
+        doc = _get_or_open_doc(pdf_bytes)
+        return doc.page_count
+    except Exception:
+        try:
+            return len(PyPDF2.PdfReader(BytesIO(pdf_bytes)).pages)
+        except Exception:
+            return 0
 
 
 # --- OCR Support for scanned PDFs ---
@@ -298,14 +331,11 @@ def load_pdf_texts(pdf_bytes: bytes):
     """Extracts text from every page of a PDF using PyMuPDF (primary)
     with PyPDF2 fallback. Returns list of strings, one per page."""
     try:
-        d = fitz.open(stream=pdf_bytes, filetype="pdf")
+        d = _get_or_open_doc(pdf_bytes)
         texts = []
-        try:
-            for i in range(d.page_count):
-                p = d.load_page(i)
-                texts.append(p.get_text("text") or "")
-        finally:
-            d.close()
+        for i in range(d.page_count):
+            p = d.load_page(i)
+            texts.append(p.get_text("text") or "")
         return texts
     except Exception as e:
         print(f"PyMuPDF failed: {e}")
@@ -323,18 +353,7 @@ def load_pdf_texts(pdf_bytes: bytes):
 @st.cache_data(show_spinner=False)
 def get_pdf_page_count(pdf_bytes: bytes) -> int:
     """Returns total number of pages in PDF via PyMuPDF with PyPDF2 fallback."""
-    try:
-        d = fitz.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            return d.page_count
-        finally:
-            d.close()
-    except Exception as e:
-        print(f"PyMuPDF page count failed: {e}")
-        try:
-            return len(PyPDF2.PdfReader(BytesIO(pdf_bytes)).pages)
-        except Exception:
-            return 0
+    return _get_page_count(pdf_bytes)
 
 
 @st.cache_data(show_spinner=False)
@@ -342,16 +361,13 @@ def get_pdf_bookmarks(pdf_bytes: bytes) -> list:
     """Extracts PDF table of contents / bookmarks via PyMuPDF.
     Returns list of dicts: {'title': str, 'page': int (0-based)}."""
     try:
-        d = fitz.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            toc = d.get_toc()
-            bookmarks = []
-            for item in toc:
-                level, title, page_num = item[:3]
-                bookmarks.append({"title": title.strip(), "page": page_num - 1})
-            return bookmarks
-        finally:
-            d.close()
+        doc = _get_or_open_doc(pdf_bytes)
+        toc = doc.get_toc()
+        bookmarks = []
+        for item in toc:
+            level, title, page_num = item[:3]
+            bookmarks.append({"title": title.strip(), "page": page_num - 1})
+        return bookmarks
     except Exception as e:
         print(f"PDF bookmark extraction failed: {e}")
         return []
@@ -363,12 +379,9 @@ def get_pdf_page_text(pdf_bytes: bytes, page_index: int, use_ocr: bool = False) 
     with PyPDF2 fallback. Optionally runs OCR if use_ocr=True."""
     text = ""
     try:
-        d = fitz.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            p = d.load_page(page_index)
-            text = p.get_text("text") or ""
-        finally:
-            d.close()
+        doc = _get_or_open_doc(pdf_bytes)
+        p = doc.load_page(page_index)
+        text = p.get_text("text") or ""
     except Exception as e:
         print(f"PyMuPDF page text failed: {e}")
         try:
@@ -394,6 +407,8 @@ def get_current_page_text(pdf_bytes: bytes, use_ocr: bool = False) -> str:
         return ""
     page_index = max(0, min(page_index, total_pages - 1))
     st.session_state["page_index"] = page_index
+    if "page_input" in st.session_state:
+        st.session_state["page_input"] = page_index + 1
     return get_pdf_page_text(pdf_bytes, page_index, use_ocr=use_ocr) or ""
 
 
@@ -402,14 +417,11 @@ def cached_page_image(pdf_bytes: bytes, page_index: int, zoom: float = 1.6):
     """Renders a single PDF page as PNG image via PyMuPDF.
     Returns PNG bytes or None on failure. Results cached."""
     try:
-        d = fitz.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            p = d.load_page(page_index)
-            mat = fitz.Matrix(zoom, zoom)
-            pix = p.get_pixmap(matrix=mat, alpha=False)
-            return pix.tobytes("png")
-        finally:
-            d.close()
+        doc = _get_or_open_doc(pdf_bytes)
+        p = doc.load_page(page_index)
+        mat = fitz.Matrix(zoom, zoom)
+        pix = p.get_pixmap(matrix=mat, alpha=False)
+        return pix.tobytes("png")
     except Exception as e:
         print(f"PDF page image rendering failed: {e}")
         return None
@@ -769,18 +781,25 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
     parsed = parse_voice_command(cmd)
     t = parsed["type"]
 
+    def _sync_page_input():
+        """Syncs page_input widget to match page_index."""
+        st.session_state["page_input"] = st.session_state["page_index"] + 1
+
     if t == "next":
         if st.session_state["page_index"] < total_pages - 1:
             st.session_state["page_index"] += 1
+            _sync_page_input()
 
     elif t == "prev":
         if st.session_state["page_index"] > 0:
             st.session_state["page_index"] -= 1
+            _sync_page_input()
 
     elif t == "page":
         p = parsed["value"] - 1
         if 0 <= p < total_pages:
             st.session_state["page_index"] = p
+            _sync_page_input()
         if parsed.get("read_after"):
             _read_current_page(pdf_bytes, total_pages, enable_ocr, rate, sync_highlight)
 
@@ -790,6 +809,7 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             ch = parsed["value"] - 1
             if 0 <= ch < len(bookmarks):
                 st.session_state["page_index"] = bookmarks[ch]["page"]
+                _sync_page_input()
                 st.sidebar.success(f"Went to chapter {ch+1}: {bookmarks[ch]['title']}")
             else:
                 st.sidebar.info(f"Chapter {parsed['value']} not found. Max: {len(bookmarks)}")
@@ -802,6 +822,7 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             for bm in bookmarks:
                 if bm["page"] > st.session_state["page_index"]:
                     st.session_state["page_index"] = bm["page"]
+                    _sync_page_input()
                     st.sidebar.success(f"Next chapter: {bm['title']}")
                     break
 
@@ -811,6 +832,7 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             for bm in reversed(bookmarks):
                 if bm["page"] < st.session_state["page_index"]:
                     st.session_state["page_index"] = bm["page"]
+                    _sync_page_input()
                     st.sidebar.success(f"Previous chapter: {bm['title']}")
                     break
 
@@ -820,6 +842,7 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             for bm in bookmarks:
                 if bm["title"].lower() in parsed.get("text", ""):
                     st.session_state["page_index"] = bm["page"]
+                    _sync_page_input()
                     st.sidebar.success(f"Went to: {bm['title']}")
                     break
             else:
@@ -842,23 +865,33 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
 # --- UI: Sidebar uploader / speed controls ---
 use_local_file = st.sidebar.checkbox(
     "Load PDF from server",
-    help="Use a PDF already present in the app folder instead of uploading one.",
+    value=bool(PDF_DIR),
+    help="Use a PDF already present on the server instead of uploading via browser.",
 )
-st.sidebar.caption("Server PDFs are usually faster than browser uploads.")
+if PDF_DIR:
+    st.sidebar.caption(f"PDF directory: {PDF_DIR}")
+else:
+    st.sidebar.caption("Server PDFs are faster than browser uploads.")
 local_pdf_choice = None
 if use_local_file:
     import glob
 
-    pdf_files = glob.glob(os.path.join(os.getcwd(), "*.pdf"))
+    _search_dirs = [os.getcwd()]
+    if PDF_DIR:
+        _search_dirs.insert(0, PDF_DIR)
+    pdf_files = []
+    for _d in _search_dirs:
+        pdf_files.extend(glob.glob(os.path.join(_d, "*.pdf")))
+    pdf_files = sorted(set(pdf_files))
     if not pdf_files:
         st.sidebar.info(
-            "No PDF files found in project root. Place your PDF in the project folder."
+            "No PDF files found. Place your PDF in the project folder or PDF_DIR."
         )
     else:
         names = [os.path.basename(p) for p in pdf_files]
-        sel = st.sidebar.selectbox("Choose PDF from server", names)
-        local_pdf_choice = os.path.join(os.getcwd(), sel)
-        st.sidebar.caption(f"Selected: {local_pdf_choice}")
+        sel = st.sidebar.selectbox("Choose PDF from server", names, key="server_pdf_sel")
+        local_pdf_choice = pdf_files[names.index(sel)]
+        st.sidebar.caption(f"Selected: {os.path.basename(local_pdf_choice)}")
 
 uploaded_pdf = (
     None if use_local_file else st.sidebar.file_uploader("Upload PDF", type=["pdf"])
@@ -936,7 +969,14 @@ if uploaded_pdf or local_pdf_choice:
         st.info("Upload a PDF in the sidebar to begin.")
         st.stop()
 
-    total_pages = get_pdf_page_count(pdf_bytes)
+    # Close any previously cached document (new upload = new doc)
+    _close_pdf_doc()
+
+    size_mb = len(pdf_bytes) / (1024 * 1024)
+    if size_mb > 20:
+        st.sidebar.warning(f"Large PDF ({size_mb:.1f} MB) — first render may be slow.")
+
+    total_pages = _get_page_count(pdf_bytes)
 
     st.sidebar.write(f"Pages: {total_pages}")
 
@@ -944,9 +984,8 @@ if uploaded_pdf or local_pdf_choice:
     if show_diag:
         st.sidebar.write(f"pdf_bytes size: {len(pdf_bytes)} bytes")
         try:
-            d_check = fitz.open(stream=pdf_bytes, filetype="pdf")
-            raw_count = d_check.page_count
-            d_check.close()
+            doc_check = _get_or_open_doc(pdf_bytes)
+            raw_count = doc_check.page_count
         except Exception:
             try:
                 raw_count = len(PyPDF2.PdfReader(BytesIO(pdf_bytes)).pages)
@@ -964,10 +1003,16 @@ if uploaded_pdf or local_pdf_choice:
         )
         st.sidebar.write(f"session page_index: {st.session_state.get('page_index')}")
 
+    def _goto_page(page_index: int):
+        """Sets page_index and syncs the page_input widget."""
+        st.session_state["page_index"] = page_index
+        if "page_input" in st.session_state:
+            st.session_state["page_input"] = page_index + 1
+
     if "page_index" not in st.session_state:
-        st.session_state["page_index"] = 0
+        _goto_page(0)
     if st.session_state["page_index"] >= total_pages:
-        st.session_state["page_index"] = max(0, total_pages - 1)
+        _goto_page(max(0, total_pages - 1))
 
     audio_container = st.empty()
 
@@ -975,34 +1020,33 @@ if uploaded_pdf or local_pdf_choice:
 
     st.sidebar.metric("Current Page", f"{st.session_state['page_index'] + 1} / {total_pages}")
 
-    page_input = st.sidebar.number_input(
+    st.sidebar.number_input(
         "Page number",
         min_value=1,
         max_value=max(1, total_pages),
         value=st.session_state["page_index"] + 1,
         step=1,
         key="page_input",
+        on_change=lambda: _goto_page(st.session_state["page_input"] - 1),
     )
-    if page_input - 1 != st.session_state["page_index"]:
-        st.session_state["page_index"] = page_input - 1
 
     col1, col2 = st.sidebar.columns([1, 1])
     with col1:
         if col1.button("Prev", key="nav_prev"):
             if st.session_state["page_index"] > 0:
-                st.session_state["page_index"] -= 1
+                _goto_page(st.session_state["page_index"] - 1)
     with col2:
         if col2.button("Next", key="nav_next"):
             if st.session_state["page_index"] < total_pages - 1:
-                st.session_state["page_index"] += 1
+                _goto_page(st.session_state["page_index"] + 1)
 
     colf, coll = st.sidebar.columns([1, 1])
     with colf:
         if colf.button("First", key="nav_first"):
-            st.session_state["page_index"] = 0
+            _goto_page(0)
     with coll:
         if coll.button("Last", key="nav_last"):
-            st.session_state["page_index"] = max(0, total_pages - 1)
+            _goto_page(max(0, total_pages - 1))
 
     enable_ocr = st.sidebar.toggle(
         "Enable OCR for scanned PDFs",
@@ -1202,10 +1246,11 @@ if uploaded_pdf or local_pdf_choice:
 
     page_index = st.session_state["page_index"]
     page_image = None
-    try:
-        page_image = cached_page_image(pdf_bytes, page_index, zoom=1.6)
-    except Exception:
-        page_image = None
+    with st.spinner(f"Rendering page {page_index + 1}..."):
+        try:
+            page_image = cached_page_image(pdf_bytes, page_index, zoom=PDF_RENDER_ZOOM)
+        except Exception:
+            page_image = None
 
     if page_image is not None:
         st.image(page_image, caption=f"Page {page_index + 1}")
