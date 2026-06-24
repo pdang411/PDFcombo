@@ -407,8 +407,6 @@ def get_current_page_text(pdf_bytes: bytes, use_ocr: bool = False) -> str:
         return ""
     page_index = max(0, min(page_index, total_pages - 1))
     st.session_state["page_index"] = page_index
-    if "page_input" in st.session_state:
-        st.session_state["page_input"] = page_index + 1
     return get_pdf_page_text(pdf_bytes, page_index, use_ocr=use_ocr) or ""
 
 
@@ -781,25 +779,18 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
     parsed = parse_voice_command(cmd)
     t = parsed["type"]
 
-    def _sync_page_input():
-        """Syncs page_input widget to match page_index."""
-        st.session_state["page_input"] = st.session_state["page_index"] + 1
-
     if t == "next":
         if st.session_state["page_index"] < total_pages - 1:
             st.session_state["page_index"] += 1
-            _sync_page_input()
 
     elif t == "prev":
         if st.session_state["page_index"] > 0:
             st.session_state["page_index"] -= 1
-            _sync_page_input()
 
     elif t == "page":
         p = parsed["value"] - 1
         if 0 <= p < total_pages:
             st.session_state["page_index"] = p
-            _sync_page_input()
         if parsed.get("read_after"):
             _read_current_page(pdf_bytes, total_pages, enable_ocr, rate, sync_highlight)
 
@@ -809,7 +800,6 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             ch = parsed["value"] - 1
             if 0 <= ch < len(bookmarks):
                 st.session_state["page_index"] = bookmarks[ch]["page"]
-                _sync_page_input()
                 st.sidebar.success(f"Went to chapter {ch+1}: {bookmarks[ch]['title']}")
             else:
                 st.sidebar.info(f"Chapter {parsed['value']} not found. Max: {len(bookmarks)}")
@@ -822,7 +812,6 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             for bm in bookmarks:
                 if bm["page"] > st.session_state["page_index"]:
                     st.session_state["page_index"] = bm["page"]
-                    _sync_page_input()
                     st.sidebar.success(f"Next chapter: {bm['title']}")
                     break
 
@@ -832,7 +821,6 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             for bm in reversed(bookmarks):
                 if bm["page"] < st.session_state["page_index"]:
                     st.session_state["page_index"] = bm["page"]
-                    _sync_page_input()
                     st.sidebar.success(f"Previous chapter: {bm['title']}")
                     break
 
@@ -842,7 +830,6 @@ def exec_voice_command(cmd: str, pdf_bytes, total_pages, enable_ocr, rate, sync_
             for bm in bookmarks:
                 if bm["title"].lower() in parsed.get("text", ""):
                     st.session_state["page_index"] = bm["page"]
-                    _sync_page_input()
                     st.sidebar.success(f"Went to: {bm['title']}")
                     break
             else:
@@ -1003,10 +990,8 @@ if uploaded_pdf or local_pdf_choice:
         st.sidebar.write(f"session page_index: {st.session_state.get('page_index')}")
 
     def _goto_page(page_index: int):
-        """Sets page_index and syncs the page_input widget."""
+        """Sets page_index."""
         st.session_state["page_index"] = page_index
-        if "page_input" in st.session_state:
-            st.session_state["page_input"] = page_index + 1
 
     if "page_index" not in st.session_state:
         _goto_page(0)
@@ -1019,15 +1004,14 @@ if uploaded_pdf or local_pdf_choice:
 
     st.sidebar.metric("Current Page", f"{st.session_state['page_index'] + 1} / {total_pages}")
 
-    st.sidebar.number_input(
+    page_num = st.sidebar.number_input(
         "Page number",
         min_value=1,
         max_value=max(1, total_pages),
         value=st.session_state["page_index"] + 1,
         step=1,
-        key="page_input",
-        on_change=lambda: _goto_page(st.session_state["page_input"] - 1),
     )
+    st.session_state["page_index"] = page_num - 1
 
     col1, col2 = st.sidebar.columns([1, 1])
     with col1:
